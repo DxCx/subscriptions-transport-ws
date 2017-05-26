@@ -1,128 +1,237 @@
 import * as WebSocket from 'ws';
 
-import {
-  SUBSCRIPTION_FAIL,
-  SUBSCRIPTION_DATA,
-  SUBSCRIPTION_START,
-  SUBSCRIPTION_END,
-  SUBSCRIPTION_SUCCESS,
-  KEEPALIVE,
-  INIT,
-  INIT_FAIL,
-  INIT_SUCCESS,
-} from './messageTypes';
-import {GRAPHQL_SUBSCRIPTIONS} from './protocols';
-import {SubscriptionManager} from 'graphql-subscriptions';
+import MessageTypes from './message-types';
+import { GRAPHQL_WS, GRAPHQL_SUBSCRIPTIONS } from './protocol';
+import { SubscriptionManager } from 'graphql-subscriptions';
 import isObject = require('lodash.isobject');
+import { parse, ExecutionResult, GraphQLSchema, DocumentNode } from 'graphql';
+import { executeFromSubscriptionManager } from './adapters/subscription-manager';
+import { createEmptyIterable } from './utils/empty-iterable';
+import { createAsyncIterator, forAwaitEach, isAsyncIterable } from 'iterall';
+import { createIterableFromPromise } from './utils/promise-to-iterable';
+import { isASubscriptionOperation } from './utils/is-subscriptions';
+import { parseLegacyProtocolMessage } from './legacy/parse-legacy-protocol';
+import { defineDeprecateFunctionWrapper } from './legacy/define-deprecation-function-wrapper';
+import { IncomingMessage } from 'http';
 
-type ConnectionSubscriptions = {[subId: string]: number};
+export type ExecutionIterator = AsyncIterator<ExecutionResult>;
 
-type ConnectionContext = {
-  initPromise?: Promise<any>
+export type ConnectionContext = {
+  initPromise?: Promise<any>,
+  isLegacy: boolean,
+  socket: WebSocket,
+  operations: {
+    [opId: string]: ExecutionIterator,
+  },
 };
 
-export interface SubscribeMessage {
-  [key: string]: any; // any extension that will come with the message.
-  payload: string;
+export interface OperationMessagePayload {
+  [key: string]: any; // this will support for example any options sent in init like the auth token
   query?: string;
-  variables?: {[key: string]: any};
+  variables?: { [key: string]: any };
   operationName?: string;
-  id: string;
+}
+
+export interface OperationMessage {
+  payload?: OperationMessagePayload;
+  id?: string;
   type: string;
 }
 
+export type ExecuteFunction = (schema: GraphQLSchema,
+                               document: DocumentNode,
+                               rootValue?: any,
+                               contextValue?: any,
+                               variableValues?: { [key: string]: any },
+                               operationName?: string) => Promise<ExecutionResult> | AsyncIterator<ExecutionResult>;
+
+export type SubscribeFunction = (schema: GraphQLSchema,
+                                 document: DocumentNode,
+                                 rootValue?: any,
+                                 contextValue?: any,
+                                 variableValues?: { [key: string]: any },
+                                 operationName?: string) => AsyncIterator<ExecutionResult>;
+
 export interface ServerOptions {
-  subscriptionManager: SubscriptionManager;
-  onSubscribe?: Function;
-  onUnsubscribe?: Function;
+  rootValue?: any;
+  schema?: GraphQLSchema;
+  execute?: ExecuteFunction;
+  subscribe?: SubscribeFunction;
+
+  onOperation?: Function;
+  onOperationComplete?: Function;
   onConnect?: Function;
   onDisconnect?: Function;
   keepAlive?: number;
-  // contextValue?: any;
-  // rootValue?: any;
-  // formatResponse?: (Object) => Object;
-  // validationRules?: Array<any>;
-  // triggerGenerator?: (name: string, args: Object, context?: Object) => Array<{name: string, filter: Function}>;
+
+  /**
+   * @deprecated subscriptionManager is deprecated, use executor instead
+   */
+  subscriptionManager?: SubscriptionManager;
+  /**
+   * @deprecated onSubscribe is deprecated, use onOperation instead
+   */
+  onSubscribe?: Function;
+  /**
+   * @deprecated onUnsubscribe is deprecated, use onOperationComplete instead
+   */
+  onUnsubscribe?: Function;
 }
 
 export class SubscriptionServer {
-  private onSubscribe: Function;
-  private onUnsubscribe: Function;
+  private onOperation: Function;
+  private onOperationComplete: Function;
   private onConnect: Function;
   private onDisconnect: Function;
+
   private wsServer: WebSocket.Server;
-  private subscriptionManager: SubscriptionManager;
+  private execute: ExecuteFunction;
+  private subscribe: SubscribeFunction;
+  private schema: GraphQLSchema;
+  private rootValue: any;
+
+  /**
+   * @deprecated onSubscribe is deprecated, use onOperation instead
+   */
+  private onSubscribe: Function;
+  /**
+   * @deprecated onUnsubscribe is deprecated, use onOperationComplete instead
+   */
+  private onUnsubscribe: Function;
+
+  public static create(options: ServerOptions, socketOptions: WebSocket.IServerOptions) {
+    return new SubscriptionServer(options, socketOptions);
+  }
 
   constructor(options: ServerOptions, socketOptions: WebSocket.IServerOptions) {
-    const {subscriptionManager, onSubscribe, onUnsubscribe, onConnect, onDisconnect, keepAlive} = options;
+    const {
+      onSubscribe, onUnsubscribe, onOperation,
+      onOperationComplete, onConnect, onDisconnect, keepAlive,
+    } = options;
 
-    if (!subscriptionManager) {
-      throw new Error('Must provide `subscriptionManager` to websocket server constructor.');
-    }
+    this.loadExecutor(options);
 
-    this.subscriptionManager = subscriptionManager;
-    this.onSubscribe = onSubscribe;
-    this.onUnsubscribe = onUnsubscribe;
+    this.onOperation = onSubscribe ? onSubscribe : onOperation;
+    this.onOperationComplete = onUnsubscribe ? onUnsubscribe : onOperationComplete;
     this.onConnect = onConnect;
     this.onDisconnect = onDisconnect;
 
-    // init and connect websocket server to http
+    this.onSubscribe = onSubscribe ?
+      defineDeprecateFunctionWrapper('onSubscribe function is deprecated. Use onOperation instead.') : null;
+    this.onUnsubscribe = onUnsubscribe ?
+      defineDeprecateFunctionWrapper('onUnsubscribe function is deprecated. Use onOperationComplete instead.') : null;
+
+    // Init and connect websocket server to http
     this.wsServer = new WebSocket.Server(socketOptions || {});
 
-    this.wsServer.on('connection', (request: WebSocket) => {
-      if (request.protocol === undefined || request.protocol.indexOf(GRAPHQL_SUBSCRIPTIONS) === -1) {
-        // Close the connection with an error code, and
-        // then terminates the actual network connection (sends FIN packet)
+    this.wsServer.on('connection', ((socket: WebSocket, request: IncomingMessage) => {
+      socket.upgradeReq = request;
+      // NOTE: the old GRAPHQL_SUBSCRIPTIONS protocol support should be removed in the future
+      if (socket.protocol === undefined ||
+        (socket.protocol.indexOf(GRAPHQL_WS) === -1 && socket.protocol.indexOf(GRAPHQL_SUBSCRIPTIONS) === -1)) {
+        // Close the connection with an error code, ws v2 ensures that the
+        // connection is cleaned up even when the closing handshake fails.
         // 1002: protocol error
-        request.close(1002);
-        request.terminate();
+        socket.close(1002);
 
         return;
       }
 
+      const connectionContext: ConnectionContext = Object.create(null);
+      connectionContext.isLegacy = false;
+      connectionContext.socket = socket;
+      connectionContext.operations = {};
+
       // Regular keep alive messages if keepAlive is set
       if (keepAlive) {
         const keepAliveTimer = setInterval(() => {
-          if (request.readyState === WebSocket.OPEN) {
-            this.sendKeepAlive(request);
+          if (socket.readyState === WebSocket.OPEN) {
+            this.sendMessage(connectionContext, undefined, MessageTypes.GQL_CONNECTION_KEEP_ALIVE, undefined);
           } else {
             clearInterval(keepAliveTimer);
           }
         }, keepAlive);
       }
 
-      const connectionSubscriptions: ConnectionSubscriptions = Object.create(null);
-      const connectionContext: ConnectionContext = Object.create(null);
+      const connectionClosedHandler = (error: any) => {
+        if (error) {
+          this.sendError(
+            connectionContext,
+            '',
+            { message: error.message ? error.message : error },
+            MessageTypes.GQL_CONNECTION_ERROR,
+          );
 
-      request.on('message', this.onMessage(request, connectionSubscriptions, connectionContext));
-      request.on('close', () => {
-        this.onClose(request, connectionSubscriptions)();
+          setTimeout(() => {
+            // 1011 is an unexpected condition prevented the request from being fulfilled
+            connectionContext.socket.close(1011);
+          }, 10);
+        }
+        this.onClose(connectionContext);
 
         if (this.onDisconnect) {
-          this.onDisconnect(request);
+          this.onDisconnect(socket);
         }
-      });
-    });
+      };
+
+      socket.on('error', connectionClosedHandler);
+      socket.on('close', connectionClosedHandler);
+      socket.on('message', this.onMessage(connectionContext));
+    }) as any);
   }
 
-  private unsubscribe(connection: WebSocket, handleId: number) {
-    this.subscriptionManager.unsubscribe(handleId);
+  private loadExecutor(options: ServerOptions) {
+    const { subscriptionManager, execute, subscribe, schema, rootValue } = options;
 
-    if (this.onUnsubscribe) {
-      this.onUnsubscribe(connection);
+    if (!subscriptionManager && !execute) {
+      throw new Error('Must provide `subscriptionManager` or `execute` to websocket server constructor.');
+    }
+
+    if (subscriptionManager && execute) {
+      throw new Error('Must provide `subscriptionManager` or `execute` and not both.');
+    }
+
+    if (subscribe && !execute) {
+      throw new Error('Must provide `execute` when providing `subscribe`!');
+    }
+
+    if (execute && !schema) {
+      throw new Error('Must provide `schema` when using `execute`.');
+    }
+
+    if (subscriptionManager) {
+      console.warn('subscriptionManager is deprecated, use `execute` or `subscribe` directly from `graphql-js`!');
+    }
+
+    this.schema = schema;
+    this.rootValue = rootValue;
+
+    if (subscriptionManager) {
+      this.execute = executeFromSubscriptionManager(subscriptionManager);
+    } else {
+      this.execute = execute;
+      this.subscribe = subscribe;
     }
   }
 
-  private onClose(connection: WebSocket, connectionSubscriptions: ConnectionSubscriptions) {
-    return () => {
-      Object.keys(connectionSubscriptions).forEach((subId) => {
-        this.unsubscribe(connection, connectionSubscriptions[subId]);
-        delete connectionSubscriptions[subId];
-      });
-    };
+  private unsubscribe(connectionContext: ConnectionContext, opId: string) {
+    if (connectionContext.operations && connectionContext.operations[opId]) {
+      connectionContext.operations[opId].return();
+      delete connectionContext.operations[opId];
+
+      if (this.onOperationComplete) {
+        this.onOperationComplete(connectionContext.socket);
+      }
+    }
   }
 
-  private onMessage(connection: WebSocket, connectionSubscriptions: ConnectionSubscriptions, connectionContext: ConnectionContext) {
+  private onClose(connectionContext: ConnectionContext) {
+    Object.keys(connectionContext.operations).forEach((opId) => {
+      this.unsubscribe(connectionContext, opId);
+    });
+  }
+
+  private onMessage(connectionContext: ConnectionContext) {
     let onInitResolve: any = null, onInitReject: any = null;
 
     connectionContext.initPromise = new Promise((resolve, reject) => {
@@ -131,23 +240,25 @@ export class SubscriptionServer {
     });
 
     return (message: any) => {
-      let parsedMessage: SubscribeMessage;
+      let parsedMessage: OperationMessage;
       try {
-        parsedMessage = JSON.parse(message);
+        parsedMessage = parseLegacyProtocolMessage(connectionContext, JSON.parse(message));
       } catch (e) {
-        this.sendSubscriptionFail(connection, null, {errors: [{message: e.message}]});
+        this.sendError(connectionContext, null, { message: e.message }, MessageTypes.GQL_CONNECTION_ERROR);
         return;
       }
 
-      const subId = parsedMessage.id;
+      const opId = parsedMessage.id;
       switch (parsedMessage.type) {
-        case INIT:
+        case MessageTypes.GQL_CONNECTION_INIT:
           let onConnectPromise = Promise.resolve(true);
           if (this.onConnect) {
             onConnectPromise = new Promise((resolve, reject) => {
               try {
-                resolve(this.onConnect(parsedMessage.payload, connection));
-            } catch (e) {
+                // TODO - this should become a function call with just 2 arguments in the future
+                // when we release the breaking change api: parsedMessage.payload and connectionContext
+                resolve(this.onConnect(parsedMessage.payload, connectionContext.socket, connectionContext));
+              } catch (e) {
                 reject(e);
               }
             });
@@ -160,157 +271,208 @@ export class SubscriptionServer {
               throw new Error('Prohibited connection!');
             }
 
-            return {
-              type: INIT_SUCCESS,
-            };
+            this.sendMessage(
+              connectionContext,
+              undefined,
+              MessageTypes.GQL_CONNECTION_ACK,
+              undefined,
+            );
           }).catch((error: Error) => {
-            return {
-              type: INIT_FAIL,
-              payload: {
-                error: error.message,
-              },
-            };
-          }).then((resultMessage: any) => {
-            this.sendInitResult(connection, resultMessage);
-          });
+            this.sendError(
+              connectionContext,
+              opId,
+              { message: error.message },
+              MessageTypes.GQL_CONNECTION_ERROR,
+            );
 
+            // Close the connection with an error code, ws v2 ensures that the
+            // connection is cleaned up even when the closing handshake fails.
+            // 1011: an unexpected condition prevented the operation from being fulfilled
+            // We are using setTimeout because we want the message to be flushed before
+            // disconnecting the client
+            setTimeout(() => {
+              connectionContext.socket.close(1011);
+            }, 10);
+          });
           break;
 
-        case SUBSCRIPTION_START:
+        case MessageTypes.GQL_CONNECTION_TERMINATE:
+          connectionContext.socket.close();
+          break;
+
+        case MessageTypes.GQL_START:
           connectionContext.initPromise.then((initResult) => {
+            // if we already have a subscription with this id, unsubscribe from it first
+            if (connectionContext.operations && connectionContext.operations[opId]) {
+              this.unsubscribe(connectionContext, opId);
+            }
+
             const baseParams = {
-              query: parsedMessage.query,
-              variables: parsedMessage.variables,
-              operationName: parsedMessage.operationName,
-              context: Object.assign({}, isObject(initResult) ? initResult : {}),
+              query: parsedMessage.payload.query,
+              variables: parsedMessage.payload.variables,
+              operationName: parsedMessage.payload.operationName,
+              context: Object.assign(
+                {},
+                isObject(initResult) ? initResult : {},
+              ),
               formatResponse: <any>undefined,
               formatError: <any>undefined,
               callback: <any>undefined,
             };
             let promisedParams = Promise.resolve(baseParams);
 
-            if (this.onSubscribe) {
-              promisedParams = Promise.resolve(this.onSubscribe(parsedMessage, baseParams, connection));
+            // set an initial mock subscription to only registering opId
+            connectionContext.operations[opId] = createEmptyIterable();
+
+            if (this.onOperation) {
+              let messageForCallback: any = parsedMessage;
+
+              if (this.onSubscribe) {
+                messageForCallback = parsedMessage.payload;
+              }
+
+              promisedParams = Promise.resolve(this.onOperation(messageForCallback, baseParams, connectionContext.socket));
             }
 
-            // if we already have a subscription with this id, unsubscribe from it first
-            // TODO: test that this actually works
-            if (connectionSubscriptions[subId]) {
-              this.unsubscribe(connection, connectionSubscriptions[subId]);
-              delete connectionSubscriptions[subId];
-            }
-
-            promisedParams.then(params => {
+            promisedParams.then((params: any) => {
               if (typeof params !== 'object') {
-                const error = `Invalid params returned from onSubscribe! return values must be an object!`;
-                this.sendSubscriptionFail(connection, subId, {
-                  errors: [{
-                    message: error,
-                  }],
-                });
+                const error = `Invalid params returned from onOperation! return values must be an object!`;
+                this.sendError(connectionContext, opId, { message: error });
 
                 throw new Error(error);
               }
 
-              // create a callback
-              // error could be a runtime exception or an object with errors
-              // result is a GraphQL ExecutionResult, which has an optional errors property
-              params.callback = (error: any, result: any) => {
-                if (!error) {
-                  this.sendSubscriptionData(connection, subId, result);
-                } else if (error.errors) {
-                  this.sendSubscriptionData(connection, subId, {errors: error.errors});
-                } else {
-                  this.sendSubscriptionData(connection, subId, {errors: [{message: error.message}]});
-                }
-              };
+              const document = typeof baseParams.query !== 'string' ? baseParams.query : parse(baseParams.query);
+              let executionIterable: AsyncIterator<ExecutionResult>;
 
-              return this.subscriptionManager.subscribe(params);
-            }).then((graphqlSubId: number) => {
-              connectionSubscriptions[subId] = graphqlSubId;
-              this.sendSubscriptionSuccess(connection, subId);
-            }).catch(e => {
-              if (e.errors) {
-                this.sendSubscriptionFail(connection, subId, {errors: e.errors});
+              if (this.subscribe && isASubscriptionOperation(document, params.operationName)) {
+                executionIterable = this.subscribe(this.schema,
+                  document,
+                  this.rootValue,
+                  params.context,
+                  params.variables,
+                  params.operationName);
               } else {
-                this.sendSubscriptionFail(connection, subId, {errors: [{message: e.message}]});
+                const promiseOrIterable = this.execute(this.schema,
+                  document,
+                  this.rootValue,
+                  params.context,
+                  params.variables,
+                  params.operationName);
+
+                if (!isAsyncIterable(promiseOrIterable) && promiseOrIterable instanceof Promise) {
+                  executionIterable = createIterableFromPromise<ExecutionResult>(promiseOrIterable);
+                } else if (isAsyncIterable(promiseOrIterable)) {
+                  executionIterable = promiseOrIterable as any;
+                } else {
+                  // Unexpected return value from execute - log it as error and trigger an error to client side
+                  console.error('Invalid `execute` return type! Only Promise or AsyncIterable are valid values!');
+
+                  this.sendError(connectionContext, opId, {
+                    message: 'GraphQL execute engine is not available',
+                  });
+                }
               }
+
+              forAwaitEach(
+                createAsyncIterator(executionIterable) as any,
+                (value: ExecutionResult) => {
+                  let result = value;
+
+                  if (params.formatResponse) {
+                    try {
+                      result = params.formatResponse(value, params);
+                    } catch (err) {
+                      console.error('Error in formatError function:', err);
+                    }
+                  }
+
+                  this.sendMessage(connectionContext, opId, MessageTypes.GQL_DATA, result);
+                })
+                .then(() => {
+                  this.sendMessage(connectionContext, opId, MessageTypes.GQL_COMPLETE, null);
+                })
+                .catch((e: Error) => {
+                  let error = e;
+
+                  if (params.formatError) {
+                    try {
+                      error = params.formatError(e, params);
+                    } catch (err) {
+                      console.error('Error in formatError function: ', err);
+                    }
+                  }
+
+                  // plain Error object cannot be JSON stringified.
+                  if (Object.keys(e).length === 0) {
+                    error = { name: e.name, message: e.message };
+                  }
+
+                  this.sendError(connectionContext, opId, error);
+                });
+
+              return executionIterable;
+            }).then((subscription: ExecutionIterator) => {
+              connectionContext.operations[opId] = subscription;
+            }).then(() => {
+              // NOTE: This is a temporary code to support the legacy protocol.
+              // As soon as the old protocol has been removed, this coode should also be removed.
+              this.sendMessage(connectionContext, opId, MessageTypes.SUBSCRIPTION_SUCCESS, undefined);
+            }).catch((e: any) => {
+              if (e.errors) {
+                this.sendMessage(connectionContext, opId, MessageTypes.GQL_DATA, { errors: e.errors });
+              } else {
+                this.sendError(connectionContext, opId, { message: e.message });
+              }
+
+              // Remove the operation on the server side as it will be removed also in the client
+              this.unsubscribe(connectionContext, opId);
               return;
             });
           });
           break;
 
-        case SUBSCRIPTION_END:
+        case MessageTypes.GQL_STOP:
           connectionContext.initPromise.then(() => {
-            // find subscription id. Call unsubscribe.
-            // TODO untested. catch errors, etc.
-            if (typeof connectionSubscriptions[subId] !== 'undefined') {
-              this.unsubscribe(connection, connectionSubscriptions[subId]);
-              delete connectionSubscriptions[subId];
-            }
+            // Find subscription id. Call unsubscribe.
+            this.unsubscribe(connectionContext, opId);
           });
           break;
 
         default:
-          this.sendSubscriptionFail(connection, subId, {
-            errors: [{
-              message: 'Invalid message type!',
-            }],
-          });
+          this.sendError(connectionContext, opId, { message: 'Invalid message type!' });
       }
     };
   }
 
-  private sendSubscriptionData(connection: WebSocket, subId: string, payload: any): void {
-    let message = {
-      type: SUBSCRIPTION_DATA,
-      id: subId,
+  private sendMessage(connectionContext: ConnectionContext, opId: string, type: string, payload: any): void {
+    const parsedMessage = parseLegacyProtocolMessage(connectionContext, {
+      type,
+      id: opId,
       payload,
-    };
-
-    connection.send(JSON.stringify(message));
-  }
-
-  private sendSubscriptionFail(connection: WebSocket, subId: string, payload: any): void {
-    let message = {
-      type: SUBSCRIPTION_FAIL,
-      id: subId,
-      payload,
-    };
-
-    connection.send(JSON.stringify(message));
-  }
-
-  private sendSubscriptionSuccess(connection: WebSocket, subId: string): void {
-    let message = {
-      type: SUBSCRIPTION_SUCCESS,
-      id: subId,
-    };
-
-    connection.send(JSON.stringify(message));
-  }
-
-  private sendInitResult(connection: WebSocket, result: any): void {
-    connection.send(JSON.stringify(result), () => {
-      if (result.type === INIT_FAIL) {
-        // Close the connection with an error code, and
-        // then terminates the actual network connection (sends FIN packet)
-        // 1011: an unexpected condition prevented the request from being fulfilled
-        // We are using setTimeout because we want the message to be flushed before
-        // disconnecting the client 
-        setTimeout(() => {
-          connection.close(1011);
-          connection.terminate();
-        }, 10);
-      }
     });
+
+    if (parsedMessage && connectionContext.socket.readyState === WebSocket.OPEN) {
+      connectionContext.socket.send(JSON.stringify(parsedMessage));
+    }
   }
 
-  private sendKeepAlive(connection: WebSocket): void {
-    let message = {
-      type: KEEPALIVE,
-    };
+  private sendError(connectionContext: ConnectionContext, opId: string, errorPayload: any,
+                    overrideDefaultErrorType?: string): void {
+    const sanitizedOverrideDefaultErrorType = overrideDefaultErrorType || MessageTypes.GQL_ERROR;
+    if ([
+        MessageTypes.GQL_CONNECTION_ERROR,
+        MessageTypes.GQL_ERROR,
+      ].indexOf(sanitizedOverrideDefaultErrorType) === -1) {
+      throw new Error('overrideDefaultErrorType should be one of the allowed error messages' +
+        ' GQL_CONNECTION_ERROR or GQL_ERROR');
+    }
 
-    connection.send(JSON.stringify(message));
+    this.sendMessage(
+      connectionContext,
+      opId,
+      sanitizedOverrideDefaultErrorType,
+      errorPayload,
+    );
   }
 }

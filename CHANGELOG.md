@@ -1,13 +1,33 @@
 # Changelog
 
 ### vNEXT
+- Client exposes new asyncronous middleware to modify `OperationOptions` [PR #78](https://github.com/apollographql/subscriptions-transport-ws/pull/78)
+- Added `WebSocketServer` error handler to prevent uncaught exceptions. Fixes [Issue #94](https://github.com/apollographql/subscriptions-transport-ws/issues/94)
+- Updated `ws` dependency to the lastest.
+- Introduce lazy mode for connection, and accept function as `connectionParams` [PR #131](https://github.com/apollographql/subscriptions-transport-ws/pull/131)
+- Extend transport protocol to support GraphQL queries and mutations over WebSocket [PR #108](https://github.com/apollographql/subscriptions-transport-ws/pull/108) 
+- Added built-in support for `subscribe` from `graphql-js` [PR #133](https://github.com/apollographql/subscriptions-transport-ws/pull/133)
+- Fixed infinity reconnects when server accepts connections but its in an error state. [PR #135](https://github.com/apollographql/subscriptions-transport-ws/pull/135)
+- Force close client-side socket when using `close()`, and ignore reconnect logic. [PR #137](https://github.com/apollographql/subscriptions-transport-ws/pull/137)
+- Added new connection events to give a more accurate control over the connection state [PR #139]. Fixes [Issue #136].
+
+### 0.6.0
+
+- Enabled Greenkeeper and updated dependencies, includes major version bump of ws [PR #90](https://github.com/apollographql/subscriptions-transport-ws/pull/90)
+
+### 0.6.0
+- Protocol update to support queries, mutations and also subscriptions. [PR #108](https://github.com/apollographql/subscriptions-transport-ws/pull/108)
+- Added support in the server for GraphQL Executor. [PR #108](https://github.com/apollographql/subscriptions-transport-ws/pull/108)
+- Added support in the server executor for `graphql-js subscribe`. [PR #846](https://github.com/graphql/graphql-js/pull/846)
+
+### 0.5.5
+- Remove dependency on `graphql-tag/printer` per [graphql-tag#54](https://github.com/apollographql/graphql-tag/issues/54) [PR #98](https://github.com/apollographql/subscriptions-transport-ws/pull/98)
 
 ### 0.5.4
 - Ensure INIT is sent before SUBSCRIPTION_START even when client reconnects [PR #85](https://github.com/apollographql/subscriptions-transport-ws/pull/85)
 - Allow data and errors in payload of SUBSCRIPTION_DATA [PR #84](https://github.com/apollographql/subscriptions-transport-ws/pull/84)
 - Expose `index.js` as entrypoint for server/NodeJS application to allow NodeJS clients to use `SubscriptionClient` [PR #91](https://github.com/apollographql/subscriptions-transport-ws/pull/91)
 - Fixed a bug with missing error message on `INIT_FAIL` message [#88](https://github.com/apollographql/subscriptions-transport-ws/issues/88)
-- Remove dependency on `graphql-tag/printer` per [graphql-tag#54](https://github.com/apollographql/graphql-tag/issues/54) [PR #98](https://github.com/apollographql/subscriptions-transport-ws/pull/98)
 
 ### 0.5.3
 - Fixed a bug with `browser` declaration on package.json ([Issue #79](https://github.com/apollographql/subscriptions-transport-ws/issues/79))
